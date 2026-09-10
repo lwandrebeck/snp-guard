@@ -404,8 +404,21 @@ fn create_guestfs_context(
     // the appliance /etc/resolv.conf into the guest before each g.sh() call,
     // so setting it once here gives every subsequent call working DNS without
     // a per-command resolv.conf hack in the guest shell.
-    g.debug("sh", &["echo nameserver 1.1.1.1 > /etc/resolv.conf"])
-        .map_err(|e| anyhow!("Failed to set appliance nameserver: {:?}", e))?;
+    //
+    // `single-request-reopen` is required, not cosmetic: glibc's resolver sends
+    // the A and AAAA queries of one getaddrinfo() in parallel over a single UDP
+    // socket, and qemu's slirp DNS forwarder (the only uplink the appliance has)
+    // routinely loses or mismatches the second reply.  glibc then reports
+    // EAI_AGAIN for the whole lookup, which apt surfaces as
+    // "Temporary failure resolving 'archive.ubuntu.com'" even though the A
+    // record resolved fine.  The option makes glibc issue the two queries
+    // sequentially on separate sockets.  A second nameserver plus a shorter
+    // timeout keep a single dropped packet from stalling the conversion.
+    g.debug(
+        "sh",
+        &["printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions single-request-reopen timeout:2 attempts:5\\n' > /etc/resolv.conf"],
+    )
+    .map_err(|e| anyhow!("Failed to set appliance nameserver: {:?}", e))?;
 
     // Inspect source and target and find rootfs
     let roots = g
@@ -1290,19 +1303,30 @@ fn compute_extra_modules_pkg(supported_kernels: &[String]) -> Result<String> {
         .join(" "))
 }
 
+/// apt options applied to every invocation inside the appliance.
+///
+/// The appliance reaches the network through qemu's slirp backend, which has no
+/// routable IPv6 uplink.  Ubuntu mirrors publish AAAA records, so without this
+/// apt picks an IPv6 address it can never connect to and the conversion stalls
+/// until every mirror address has timed out.
+const APT_OPTS: &str = "-o Acquire::ForceIPv4=true -o Acquire::Retries=3";
+
 /// Runs apt-get dry-run to verify pkg availability, then installs it.
 fn apt_install_with_dry_run(g: &guestfs::Handle, pkg: &str) -> Result<()> {
-    g.sh(&format!("apt-get install --dry-run -y {}", pkg))
-        .map_err(|_| {
-            anyhow!(
-                "{} is not available in apt. \
+    g.sh(&format!(
+        "apt-get {} install --dry-run -y {}",
+        APT_OPTS, pkg
+    ))
+    .map_err(|_| {
+        anyhow!(
+            "{} is not available in apt. \
                  The kernel in this image is likely outdated: its extra-modules \
                  package is no longer in the repository. \
                  Please provide a newer base image.",
-                pkg
-            )
-        })?;
-    g.sh(&format!("apt install -y {}", pkg))
+            pkg
+        )
+    })?;
+    g.sh(&format!("apt-get {} install -y {}", APT_OPTS, pkg))
         .map_err(|e| anyhow!("Failed to install {}: {:?}", pkg, e))?;
     Ok(())
 }
@@ -1347,13 +1371,13 @@ fn prepare_no_hardening_target(
             let pkg = compute_extra_modules_pkg(supported_kernels)?;
             if !pkg.is_empty() {
                 for cmd in [
-                    // --nohook resolv.conf: the appliance nameserver (1.1.1.1) is
-                    // already in /etc/resolv.conf; dhcpcd would overwrite it with
-                    // the DHCP-provided DNS, so we suppress that hook.
-                    "dhcpcd -1 --nohook resolv.conf eth0",
-                    "apt update -y",
+                    // --nohook resolv.conf: the appliance nameserver is already
+                    // in /etc/resolv.conf; dhcpcd would overwrite it with the
+                    // DHCP-provided DNS, so we suppress that hook.
+                    "dhcpcd -1 --nohook resolv.conf eth0".to_string(),
+                    format!("apt-get {} update -y", APT_OPTS),
                 ] {
-                    g.sh(cmd)
+                    g.sh(&cmd)
                         .map_err(|e| anyhow!("Failed to execute '{}': {:?}", cmd, e))?;
                 }
                 apt_install_with_dry_run(g, &pkg)?;
@@ -1420,14 +1444,17 @@ fn install_snpguard_on_target(
     match dist_family {
         DistroFamily::Debian | DistroFamily::Ubuntu => {
             for cmd in [
-                // --nohook resolv.conf: the appliance nameserver (1.1.1.1) is
-                // already in /etc/resolv.conf; dhcpcd would overwrite it with
-                // the DHCP-provided DNS, so we suppress that hook.
-                "dhcpcd -1 --nohook resolv.conf eth0",
-                "apt update -y",
-                "apt install -y cryptsetup cryptsetup-initramfs",
+                // --nohook resolv.conf: the appliance nameserver is already in
+                // /etc/resolv.conf; dhcpcd would overwrite it with the
+                // DHCP-provided DNS, so we suppress that hook.
+                "dhcpcd -1 --nohook resolv.conf eth0".to_string(),
+                format!("apt-get {} update -y", APT_OPTS),
+                format!(
+                    "apt-get {} install -y cryptsetup cryptsetup-initramfs",
+                    APT_OPTS
+                ),
             ] {
-                g.sh(cmd)
+                g.sh(&cmd)
                     .map_err(|e| anyhow!("Failed to execute '{}': {:?}", cmd, e))?;
             }
         }
