@@ -347,6 +347,67 @@ impl Drop for CleanupGuard {
     }
 }
 
+/// Set to any value to leave libguestfs' backend choice alone.
+const ALLOW_PASST_ENV: &str = "SNPGUARD_ALLOW_PASST";
+
+/// Steers libguestfs away from the passt network backend, onto slirp.
+///
+/// Recent libguestfs prefers passt over slirp for appliance networking and
+/// wires qemu to it with `-netdev stream` over a unix socket.  passt registers
+/// that listening socket with epoll in edge-triggered mode
+/// (`events: 80000019`), and qemu's connect lands in a window where the edge is
+/// lost: passt sits in `epoll_wait` forever without ever calling `accept()`,
+/// while qemu's end of the socket reaches ESTAB with a peer inode of 0 and
+/// fills with unread bytes.  The guest NIC has carrier but no peer, so DHCP
+/// goes unanswered, the appliance falls back to an IPv4LL address, and the
+/// first real transfer wedges the transmit queue:
+///
+///   virtio_net virtio3 eth0: NETDEV WATCHDOG: transmit queue 0 timed out
+///
+/// virtio_net has no ndo_tx_timeout recovery, so apt hangs indefinitely instead
+/// of failing.  passt is started with `--one-off`, so each wedged run also
+/// leaks a passt process that never sees a client.
+///
+/// Reproduced on Ubuntu 26.04 with libguestfs 1.58.1, qemu 10.2.1 and passt
+/// 0.0~git20260120.  Connecting to the socket by hand generates a fresh edge,
+/// after which passt drains the backlog and the stuck conversion completes --
+/// which is what identifies the missed edge as the cause.
+///
+/// libguestfs exposes no setting for the backend: `guestfs_int_passt_runnable()`
+/// runs `passt --help` through the shell and uses passt when it exits 0 or 1.
+/// Prepending a directory holding a `passt` that exits 2 is therefore the only
+/// lever available, and drops libguestfs back to slirp.
+///
+/// The returned directory must stay alive until after `launch()`, which is when
+/// libguestfs probes.  Set `SNPGUARD_ALLOW_PASST` once passt carries the fix.
+fn steer_libguestfs_to_slirp() -> Result<Option<tempfile::TempDir>> {
+    if std::env::var_os(ALLOW_PASST_ENV).is_some() {
+        return Ok(None);
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("snpguard-nopasst-")
+        .tempdir()
+        .context("Failed to create passt shim directory")?;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = dir.path().join("passt");
+    fs::write(&shim, "#!/bin/sh\nexit 2\n")
+        .with_context(|| format!("Failed to write passt shim {:?}", shim))?;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("Failed to make passt shim executable {:?}", shim))?;
+
+    let mut entries = vec![dir.path().to_path_buf()];
+    entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(entries).context("Failed to build PATH with passt shim")?;
+    std::env::set_var("PATH", path);
+
+    println!("Using the slirp network backend for the conversion appliance.");
+    Ok(Some(dir))
+}
 /// Creates a guestfs context with scratch, source, and target drives attached and launched.
 /// Returns the handle and the scratch/source/target rootfs device paths.
 fn create_guestfs_context(
@@ -354,6 +415,9 @@ fn create_guestfs_context(
     target_path: &Path,
 ) -> Result<(guestfs::Handle, String, String, String)> {
     use guestfs::{AddDriveOptArgs, AddDriveScratchOptArgs, Handle};
+
+    // Must outlive launch() below: that is when libguestfs probes for passt.
+    let _passt_shim = steer_libguestfs_to_slirp()?;
 
     let g = Handle::create().map_err(|e| anyhow!("Failed to create guestfs handle: {:?}", e))?;
 
