@@ -1376,21 +1376,50 @@ fn compute_extra_modules_pkg(supported_kernels: &[String]) -> Result<String> {
 /// to and the conversion stalls until every mirror address has timed out.
 const APT_OPTS: &str = "-o Acquire::ForceIPv4=true -o Acquire::Retries=3";
 
+/// Package prefix Ubuntu used for out-of-tree kernel modules up to 24.04.
+const EXTRA_MODULES_PREFIX: &str = "linux-modules-extra-";
+
+/// True when the guest's apt index still publishes any linux-modules-extra
+/// package, for any kernel version.
+fn release_publishes_extra_modules(g: &guestfs::Handle) -> Result<bool> {
+    let out = g
+        .sh(&format!(
+            "apt-cache pkgnames {EXTRA_MODULES_PREFIX} | head -1"
+        ))
+        .map_err(|e| anyhow!("Failed to query apt for {EXTRA_MODULES_PREFIX}*: {:?}", e))?;
+    Ok(!out.trim().is_empty())
+}
+
 /// Runs apt-get dry-run to verify pkg availability, then installs it.
+///
+/// A dry-run failure has two very different causes.  Ubuntu 26.04 dropped the
+/// linux-modules-extra binary package entirely and ships those modules inside
+/// linux-modules-* instead, so on such a release the package is absent by
+/// design and the step is skipped -- the modules are already in the image.
+/// When the release does still publish the prefix, an absent package means the
+/// image's kernel has aged out of the archive, which is a real error.
 fn apt_install_with_dry_run(g: &guestfs::Handle, pkg: &str) -> Result<()> {
-    g.sh(&format!(
+    if g.sh(&format!(
         "apt-get {} install --dry-run -y {}",
         APT_OPTS, pkg
     ))
-    .map_err(|_| {
-        anyhow!(
+    .is_err()
+    {
+        if pkg.starts_with(EXTRA_MODULES_PREFIX) && !release_publishes_extra_modules(g)? {
+            println!(
+                "Skipping {pkg}: this release publishes no {EXTRA_MODULES_PREFIX}* package \
+                 and ships those modules in linux-modules-* instead."
+            );
+            return Ok(());
+        }
+        bail!(
             "{} is not available in apt. \
-                 The kernel in this image is likely outdated: its extra-modules \
-                 package is no longer in the repository. \
-                 Please provide a newer base image.",
+             The kernel in this image is likely outdated: its extra-modules \
+             package is no longer in the repository. \
+             Please provide a newer base image.",
             pkg
-        )
-    })?;
+        );
+    }
     g.sh(&format!("apt-get {} install -y {}", APT_OPTS, pkg))
         .map_err(|e| anyhow!("Failed to install {}: {:?}", pkg, e))?;
     Ok(())
