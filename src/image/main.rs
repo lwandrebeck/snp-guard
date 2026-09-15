@@ -405,15 +405,16 @@ fn create_guestfs_context(
     // so setting it once here gives every subsequent call working DNS without
     // a per-command resolv.conf hack in the guest shell.
     //
-    // `single-request-reopen` is required, not cosmetic: glibc's resolver sends
-    // the A and AAAA queries of one getaddrinfo() in parallel over a single UDP
-    // socket, and qemu's slirp DNS forwarder (the only uplink the appliance has)
-    // routinely loses or mismatches the second reply.  glibc then reports
-    // EAI_AGAIN for the whole lookup, which apt surfaces as
-    // "Temporary failure resolving 'archive.ubuntu.com'" even though the A
-    // record resolved fine.  The option makes glibc issue the two queries
-    // sequentially on separate sockets.  A second nameserver plus a shorter
-    // timeout keep a single dropped packet from stalling the conversion.
+    // `single-request-reopen` is defensive: glibc's resolver sends the A and
+    // AAAA queries of one getaddrinfo() in parallel over a single UDP socket,
+    // and the user-mode network backend libguestfs runs (slirp on older
+    // versions, passt on newer ones) is the appliance's only uplink.  If it
+    // loses or mismatches the second reply, glibc reports EAI_AGAIN for the
+    // whole lookup and apt surfaces it as "Temporary failure resolving
+    // 'archive.ubuntu.com'" even though the A record resolved fine.  The option
+    // makes glibc issue the two queries sequentially on separate sockets.  A
+    // second nameserver plus a shorter timeout keep a single dropped packet
+    // from stalling the conversion.
     g.debug(
         "sh",
         &["printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions single-request-reopen timeout:2 attempts:5\\n' > /etc/resolv.conf"],
@@ -1305,10 +1306,10 @@ fn compute_extra_modules_pkg(supported_kernels: &[String]) -> Result<String> {
 
 /// apt options applied to every invocation inside the appliance.
 ///
-/// The appliance reaches the network through qemu's slirp backend, which has no
-/// routable IPv6 uplink.  Ubuntu mirrors publish AAAA records, so without this
-/// apt picks an IPv6 address it can never connect to and the conversion stalls
-/// until every mirror address has timed out.
+/// The appliance reaches the network through libguestfs' user-mode backend
+/// (slirp or passt), which has no routable IPv6 uplink.  Ubuntu mirrors publish
+/// AAAA records, so without this apt picks an IPv6 address it can never connect
+/// to and the conversion stalls until every mirror address has timed out.
 const APT_OPTS: &str = "-o Acquire::ForceIPv4=true -o Acquire::Retries=3";
 
 /// Runs apt-get dry-run to verify pkg availability, then installs it.
@@ -1370,16 +1371,9 @@ fn prepare_no_hardening_target(
         DistroFamily::Ubuntu => {
             let pkg = compute_extra_modules_pkg(supported_kernels)?;
             if !pkg.is_empty() {
-                for cmd in [
-                    // --nohook resolv.conf: the appliance nameserver is already
-                    // in /etc/resolv.conf; dhcpcd would overwrite it with the
-                    // DHCP-provided DNS, so we suppress that hook.
-                    "dhcpcd -1 --nohook resolv.conf eth0".to_string(),
-                    format!("apt-get {} update -y", APT_OPTS),
-                ] {
-                    g.sh(&cmd)
-                        .map_err(|e| anyhow!("Failed to execute '{}': {:?}", cmd, e))?;
-                }
+                let cmd = format!("apt-get {} update -y", APT_OPTS);
+                g.sh(&cmd)
+                    .map_err(|e| anyhow!("Failed to execute '{}': {:?}", cmd, e))?;
                 apt_install_with_dry_run(g, &pkg)?;
             }
         }
@@ -1444,10 +1438,6 @@ fn install_snpguard_on_target(
     match dist_family {
         DistroFamily::Debian | DistroFamily::Ubuntu => {
             for cmd in [
-                // --nohook resolv.conf: the appliance nameserver is already in
-                // /etc/resolv.conf; dhcpcd would overwrite it with the
-                // DHCP-provided DNS, so we suppress that hook.
-                "dhcpcd -1 --nohook resolv.conf eth0".to_string(),
                 format!("apt-get {} update -y", APT_OPTS),
                 format!(
                     "apt-get {} install -y cryptsetup cryptsetup-initramfs",
