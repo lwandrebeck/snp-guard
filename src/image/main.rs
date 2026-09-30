@@ -3,6 +3,7 @@
 // Author: Roman Penyaev <r.peniaev@gmail.com>
 
 mod local_ops;
+mod ssh_access;
 
 const HOOK_SCRIPT: &[u8] = include_bytes!("../../scripts/initramfs-tools/hook.sh");
 const ATTEST_ONLINE_SCRIPT: &[u8] =
@@ -141,6 +142,16 @@ enum Command {
         /// successful online attestation, allowing subsequent boots to proceed without network.
         #[arg(long)]
         offline_attestation: bool,
+        /// Enable key-only SSH access: create a login user holding the public keys
+        /// from this authorized_keys file, generate unique SSH host keys on the
+        /// guest's first boot, and disable cloud-init. Without it, stock cloud
+        /// images boot with no host keys and every account locked.
+        #[arg(long)]
+        ssh_authorized_keys: Option<PathBuf>,
+        /// Login user for --ssh-authorized-keys (default: "debian" or "ubuntu",
+        /// matching the image). Gets passwordless sudo.
+        #[arg(long)]
+        ssh_user: Option<String>,
     },
     /// Create a minimal launch-config.json in a staging directory for use with
     /// 'embed --in-staging'. Intended for the --no-hardening workflow where
@@ -1316,6 +1327,15 @@ fn regenerate_initramfs(g: &guestfs::Handle) -> Result<()> {
     Ok(())
 }
 
+/// Name of the login user cloud-init would create for this distribution.
+fn default_login_user(dist_family: DistroFamily) -> &'static str {
+    match dist_family {
+        DistroFamily::Debian => "debian",
+        DistroFamily::Ubuntu => "ubuntu",
+        DistroFamily::RedHat => "cloud-user",
+    }
+}
+
 /// Installs required packages and regenerates initramfs/grub for a
 /// no-hardening (unencrypted) target image. Skips LUKS, cryptsetup,
 /// encrypted-root boot configuration, and snpguard hooks.
@@ -1324,6 +1344,7 @@ fn prepare_no_hardening_target(
     target_rootfs: &str,
     supported_kernels: &[String],
     boot_partition: &BootPartition,
+    ssh_access: Option<&ssh_access::SshAccess>,
 ) -> Result<()> {
     let dist_family = get_dist_family(g, target_rootfs)?;
 
@@ -1362,6 +1383,10 @@ fn prepare_no_hardening_target(
         DistroFamily::RedHat => bail!("RedHat distributions are not supported at the moment"),
     }
 
+    if let Some(access) = ssh_access {
+        ssh_access::provision(g, access, default_login_user(dist_family))?;
+    }
+
     regenerate_initramfs(g)?;
     Ok(())
 }
@@ -1379,6 +1404,7 @@ fn install_snpguard_on_target(
     vmk_sealed_path: &str,
     attest_url: &str,
     attest_script: &[u8],
+    ssh_access: Option<&ssh_access::SshAccess>,
 ) -> Result<()> {
     // Convert VMK to string for LUKS
     let luks_key = hex::encode(vmk);
@@ -1454,6 +1480,10 @@ fn install_snpguard_on_target(
         attest_script,
     )?;
 
+    if let Some(access) = ssh_access {
+        ssh_access::provision(g, access, default_login_user(dist_family))?;
+    }
+
     regenerate_initramfs(g)?;
 
     Ok(())
@@ -1493,6 +1523,7 @@ fn run_convert(
     no_hardening: bool,
     interactive: bool,
     offline_attestation: bool,
+    ssh_access: Option<ssh_access::SshAccess>,
 ) -> Result<()> {
     let musl_client_path = find_snpguard_client()?;
     let musl_client_path = musl_client_path.to_string_lossy();
@@ -1767,11 +1798,18 @@ fn run_convert(
             } else {
                 ATTEST_ONLINE_SCRIPT
             },
+            ssh_access.as_ref(),
         )?;
         fs::remove_file(sealed_vmk_path).context("Failed to remove sealed VMK")?;
     } else {
         println!("Preparing no-hardening target (extra modules, initramfs, grub)...");
-        prepare_no_hardening_target(&g, &target_rootfs, &supported_kernels, &boot_partition)?;
+        prepare_no_hardening_target(
+            &g,
+            &target_rootfs,
+            &supported_kernels,
+            &boot_partition,
+            ssh_access.as_ref(),
+        )?;
     }
 
     println!("Extract boot artifacts (kernel, initrd, params) from target image");
@@ -2126,6 +2164,8 @@ fn main() -> Result<()> {
             no_hardening,
             interactive,
             offline_attestation,
+            ssh_authorized_keys,
+            ssh_user,
         } => run_convert(
             &in_image,
             &out_image,
@@ -2138,6 +2178,7 @@ fn main() -> Result<()> {
             no_hardening,
             interactive,
             offline_attestation,
+            ssh_access::SshAccess::from_args(ssh_authorized_keys, ssh_user)?,
         ),
         Command::MakeLaunchConfig {
             staging_dir,
