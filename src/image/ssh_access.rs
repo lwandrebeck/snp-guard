@@ -51,6 +51,17 @@ ExecStart=/usr/bin/ssh-keygen -A
 WantedBy=ssh.service
 ";
 
+const NETWORK_CONFIG_PATH: &str = "/etc/systemd/network/80-snpguard-dhcp.network";
+
+/// Same shape as cloud-init's fallback: DHCP on the wired NICs.
+const NETWORK_CONFIG: &str = "\
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+";
+
 /// Validated SSH access settings, checked before any expensive work starts.
 pub struct SshAccess {
     /// Explicit login name; `None` means the distro's customary default user.
@@ -246,8 +257,42 @@ pub fn provision(g: &guestfs::Handle, access: &SshAccess, default_user: &str) ->
     if is_dir(g, "/etc/cloud")? {
         g.touch("/etc/cloud/cloud-init.disabled")
             .map_err(|e| anyhow!("Failed to disable cloud-init: {:?}", e))?;
+        ensure_network_config(g)?;
     }
 
+    Ok(())
+}
+
+/// Writes the DHCP fallback cloud-init would otherwise render at boot.
+///
+/// Cloud images ship no network configuration for the NIC: cloud-init writes
+/// it on every boot (e.g. /run/systemd/network/10-cloud-init-*.network).  With
+/// cloud-init disabled nothing brings the interface up, and sshd listens on a
+/// guest nobody can reach.  Images that do carry their own configuration are
+/// left alone.
+fn ensure_network_config(g: &guestfs::Handle) -> Result<()> {
+    let existing = g
+        .sh("ls /etc/systemd/network/*.network /etc/netplan/*.yaml /etc/network/interfaces 2>/dev/null || true")
+        .map_err(|e| anyhow!("Failed to look for network configuration: {:?}", e))?;
+    if !existing.trim().is_empty() {
+        return Ok(());
+    }
+    if !is_file(g, "/usr/lib/systemd/systemd-networkd")? {
+        println!(
+            "WARN: the image has no network configuration and no systemd-networkd; \
+             the guest will need one to be reachable over SSH"
+        );
+        return Ok(());
+    }
+
+    g.mkdir_p("/etc/systemd/network")
+        .map_err(|e| anyhow!("Failed to mkdir /etc/systemd/network: {:?}", e))?;
+    g.write(NETWORK_CONFIG_PATH, NETWORK_CONFIG.as_bytes())
+        .map_err(|e| anyhow!("Failed to write {}: {:?}", NETWORK_CONFIG_PATH, e))?;
+    // Enabled on Debian cloud images, but only pulled in by netplan's
+    // generator on Ubuntu; enabling offline just creates the wants/ symlink.
+    g.sh("systemctl enable systemd-networkd.service")
+        .map_err(|e| anyhow!("Failed to enable systemd-networkd: {:?}", e))?;
     Ok(())
 }
 
